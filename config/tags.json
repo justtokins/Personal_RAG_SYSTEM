@@ -1,0 +1,20 @@
+{
+  "tags": [
+    "research",
+    "finance",
+    "legal",
+    "personal",
+    "work",
+    "reference",
+    "meeting-notes",
+    "contracts",
+    "invoices",
+    "correspondence",
+    "technical",
+    "project-management",
+    "health",
+    "education",
+    "media"
+  ],
+  "auto_tag_prompt": "You are a document classifier. Given the following document excerpt, assign up to {max_tags} tags from this list: {tag_list}. Return ONLY a JSON array of tag strings, nothing else. Example: [\"research\", \"finance\"]\n\nDocument excerpt:\n{content}"
+}

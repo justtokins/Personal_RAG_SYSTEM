@@ -1,0 +1,25 @@
+[Unit]
+Description=RAGBase MCP Server
+After=network.target ragbase-api.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=ragbase
+Group=ragbase
+WorkingDirectory=/opt/ragbase
+EnvironmentFile=/opt/ragbase/.env
+ExecStart=/opt/ragbase/venv/bin/python main.py mcp
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ragbase-mcp
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ragbase /var/log/ragbase
+
+[Install]
+WantedBy=multi-user.target

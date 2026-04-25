@@ -1,0 +1,22 @@
+# 1. Provision Ubuntu 22.04 droplet on DigitalOcean (4GB RAM / 80GB SSD)
+
+# 2. Point your domain DNS A record → droplet IP
+
+# 3. Clone and run setup (takes ~15 minutes, mostly Whisper model download)
+git clone https://github.com/yourname/ragbase /tmp/ragbase
+cd /tmp/ragbase
+sudo bash scripts/setup.sh
+
+# 4. Fill in /opt/ragbase/.env
+sudo nano /opt/ragbase/.env
+
+# 5. Set your domain in Caddyfile (replace {$DOMAIN} if not using env var)
+sudo nano /etc/caddy/Caddyfile
+
+# 6. Start everything
+sudo systemctl start ragbase-api ragbase-mcp caddy
+
+# 7. Verify
+curl https://YOUR_DOMAIN/health
+
+# 8. Drop something in Dropbox — wait 5 minutes — check dashboard

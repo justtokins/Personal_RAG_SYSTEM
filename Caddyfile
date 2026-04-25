@@ -1,0 +1,71 @@
+# Caddyfile — Reverse proxy for RAGBase
+# Place at: /etc/caddy/Caddyfile
+#
+# Caddy automatically provisions and renews Let's Encrypt TLS certificates.
+# Port 443 only — port 80 redirects to 443.
+# Port 8000 and 8001 are NOT exposed to the internet (firewall blocks them).
+#
+# Firewall rules (set during setup.sh):
+#   ufw allow 22/tcp    — SSH
+#   ufw allow 443/tcp   — HTTPS
+#   ufw deny 8000/tcp   — API (internal only)
+#   ufw deny 8001/tcp   — MCP (internal only)
+
+{$DOMAIN} {
+
+    # ── Dashboard + API ────────────────────────────────────────────────────
+    handle /api/* {
+        reverse_proxy localhost:8000
+    }
+
+    handle /health {
+        reverse_proxy localhost:8000
+    }
+
+    # Dashboard UI
+    handle / {
+        reverse_proxy localhost:8000
+    }
+
+    # ── MCP server ─────────────────────────────────────────────────────────
+    # Only the /mcp/* path is proxied to the MCP server.
+    # Bearer token auth is handled by the MCP server itself.
+    handle /mcp/* {
+        reverse_proxy localhost:8001 {
+            # Strip /mcp prefix before forwarding
+            header_up Host {upstream_hostport}
+        }
+    }
+
+    # ── Security headers ───────────────────────────────────────────────────
+    header {
+        X-Content-Type-Options    "nosniff"
+        X-Frame-Options           "DENY"
+        Referrer-Policy           "strict-origin"
+        Permissions-Policy        "geolocation=(), camera=(), microphone=()"
+        # Remove server identification
+        -Server
+    }
+
+    # ── Block common attack paths ──────────────────────────────────────────
+    @blocked {
+        path /admin/*
+        path /.git/*
+        path /wp-*
+        path /phpinfo*
+        path /debug*
+    }
+    respond @blocked 404
+
+    # ── Rate limiting (Caddy enterprise) or use UFW for basic protection ──
+    # rate_limit {remote_host} 100r/m
+
+    # ── Logging ───────────────────────────────────────────────────────────
+    log {
+        output file /var/log/caddy/ragbase.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+        format json
+    }
+}

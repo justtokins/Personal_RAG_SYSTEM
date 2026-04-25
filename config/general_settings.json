@@ -1,0 +1,68 @@
+{
+  "app": {
+    "name": "RAGBase",
+    "version": "1.0.0",
+    "host": "127.0.0.1",
+    "api_port": 8000,
+    "mcp_port": 8001,
+    "log_level": "INFO",
+    "log_file": "/var/log/ragbase/app.log",
+    "log_max_bytes": 10485760,
+    "log_backup_count": 5
+  },
+  "paths": {
+    "dropbox_sync": "/home/ragbase/Dropbox",
+    "db_path": "/opt/ragbase/data/ragbase.db",
+    "upload_dir": "/opt/ragbase/uploads",
+    "backup_dir": "/opt/ragbase/backups",
+    "whisper_cache": "/opt/ragbase/.whisper_cache",
+    "failed_dir": "/opt/ragbase/failed"
+  },
+  "embedding": {
+    "model_name": "BAAI/bge-small-en-v1.5",
+    "dimensions": 384,
+    "batch_size": 64,
+    "device": "cpu",
+    "normalize": true
+  },
+  "ingestion": {
+    "chunk_size": 800,
+    "chunk_overlap": 150,
+    "separators": ["\n\n", "\n", ". ", " "],
+    "embed_batch_size": 64,
+    "max_workers": 3,
+    "poll_interval_seconds": 300,
+    "supported_extensions": [
+      ".pdf", ".docx", ".doc", ".md", ".txt",
+      ".msg", ".eml",
+      ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp",
+      ".mp4", ".mov", ".avi", ".mkv", ".m4a", ".mp3", ".wav"
+    ],
+    "image_extensions": [".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp"],
+    "video_extensions": [".mp4", ".mov", ".avi", ".mkv", ".m4a", ".mp3", ".wav"],
+    "email_extensions": [".msg", ".eml"]
+  },
+  "whisper": {
+    "model": "medium",
+    "language": null,
+    "device": "cpu",
+    "chunk_duration_seconds": 30
+  },
+  "search": {
+    "default_top_k": 10,
+    "max_top_k": 50,
+    "min_score_threshold": 0.3
+  },
+  "backup": {
+    "schedule_hour": 2,
+    "schedule_minute": 0,
+    "keep_days": 30,
+    "dropbox_backup_folder": "/Backups/ragbase"
+  },
+  "tagging": {
+    "enabled": true,
+    "model": "claude-3-haiku-20240307",
+    "max_tags": 5,
+    "context_chars": 2000
+  }
+}
