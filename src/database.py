@@ -1,28 +1,30 @@
 """
 database.py — SQLite + sqlite-vec vector database.
 
-Schema overview:
-    documents     — one row per ingested file with metadata and tags
-    chunks        — text chunks extracted from documents
-    vec_chunks    — sqlite-vec virtual table storing 384-dim embeddings
-    ingest_queue  — tracks file processing state for the dashboard
+sqlite-vec 0.1.6 API notes (verified against source):
+    CREATE VIRTUAL TABLE vec_chunks USING vec0(
+        embedding FLOAT[384]
+    );
 
-Why SQLite + sqlite-vec instead of ChromaDB or Postgres?
-    - Zero external services — everything in one file on disk
-    - sqlite-vec does ANN (approximate nearest neighbour) search
-      using HNSW internally — sub-2-second search at 1M+ chunks
-    - The entire corpus is one .db file → trivial to backup / restore
-    - SQLCipher can encrypt the backup file directly
+    The vec0 table has an implicit INTEGER rowid.
+    We link chunks → vec_chunks via matching rowids.
 
-sqlite-vec search API:
-    SELECT chunk_id, distance
-    FROM vec_chunks
-    WHERE embedding MATCH ?
-      AND k = 10
-    ORDER BY distance
+    Search syntax:
+        SELECT rowid, distance
+        FROM vec_chunks
+        WHERE embedding MATCH ?    -- serialized float blob
+          AND k = ?                -- integer, not string interpolation
+        ORDER BY distance
 
-Distance is L2 by default. With normalize_embeddings=True on BGE-small,
-L2 distance is equivalent to cosine distance — smaller = more similar.
+    PARTITION KEY does NOT exist in 0.1.6 — removed.
+    The chunk_id linkage is done by inserting in the same transaction
+    and recording the sqlite last_insert_rowid() per chunk.
+
+Connection model:
+    Each call opens a fresh connection and closes it in the finally block.
+    check_same_thread=False is NOT used — each thread gets its own connection.
+    WAL mode allows concurrent readers with one writer.
+    busy_timeout=30000 (30s) handles long video ingestion write locks.
 """
 import asyncio
 import json
@@ -39,16 +41,15 @@ import sqlite_vec
 from src.config_loader import general_settings
 from src.logger import get_logger
 
-logger = get_logger()
-
+logger     = get_logger()
 DB_PATH    = general_settings["paths"]["db_path"]
 EMBED_DIMS = general_settings["embedding"]["dimensions"]
 
 
-# ── sqlite-vec serialisation ──────────────────────────────────────────────────
+# ── Serialisation ─────────────────────────────────────────────────────────────
 
 def _serialize(v: list[float]) -> bytes:
-    """Pack a float list into little-endian IEEE 754 bytes for sqlite-vec."""
+    """Pack float list into little-endian IEEE 754 for sqlite-vec MATCH."""
     return struct.pack(f"{len(v)}f", *v)
 
 
@@ -56,25 +57,35 @@ def _serialize(v: list[float]) -> bytes:
 
 def _make_conn(path: str = DB_PATH) -> sqlite3.Connection:
     """
-    Open a connection with sqlite-vec loaded and WAL mode enabled.
+    Open a new SQLite connection with sqlite-vec loaded.
 
-    WAL (Write-Ahead Logging) allows concurrent readers while a writer
-    is active — essential for the dashboard reading while ingestion writes.
+    Each call returns a brand-new connection — never share connections
+    across threads. SQLite connections are not thread-safe even with
+    check_same_thread=False when sqlite-vec is loaded.
+
+    WAL mode: readers never block writers, writers never block readers.
+    busy_timeout=30000: wait up to 30 seconds if DB is locked by a
+    long-running ingestion write (e.g. 10k-chunk video insert).
     """
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=True)
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")  # wait 5s if locked
-    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=NORMAL")   # faster than FULL, safe with WAL
+    conn.execute("PRAGMA cache_size=-64000")    # 64MB page cache
     return conn
 
 
 @contextmanager
 def get_conn(path: str = DB_PATH):
-    """Context manager — auto-commits on success, rolls back on exception."""
+    """
+    Context manager yielding a connection.
+    Commits on clean exit, rolls back on exception, always closes.
+    """
     conn = _make_conn(path)
     try:
         yield conn
@@ -86,78 +97,95 @@ def get_conn(path: str = DB_PATH):
         conn.close()
 
 
-# ── Schema setup ──────────────────────────────────────────────────────────────
+# ── Schema ────────────────────────────────────────────────────────────────────
 
 def setup_db(path: str = DB_PATH) -> None:
     """
-    Create all tables and indexes if they do not exist.
-    Safe to call on every startup — uses CREATE IF NOT EXISTS.
+    Create all tables if they do not exist.
+
+    Schema design:
+        documents   — one row per file, metadata + tags
+        chunks      — text chunks with page/timestamp metadata
+        vec_chunks  — sqlite-vec virtual table, rowid = chunk rowid
+
+    The vec_chunks rowid matches the chunks rowid in the same
+    transaction. This lets us JOIN without a separate ID column.
+
+    ingest_queue — file processing state for the dashboard.
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
     with get_conn(path) as conn:
-        conn.executescript(f"""
-            -- ── Documents ──────────────────────────────────────
+        # Documents
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS documents (
-                id           TEXT PRIMARY KEY,
-                path         TEXT NOT NULL UNIQUE,
-                filename     TEXT NOT NULL,
-                file_type    TEXT NOT NULL,
-                file_hash    TEXT NOT NULL,
-                title        TEXT,
-                tags         TEXT DEFAULT '[]',   -- JSON array
-                word_count   INTEGER DEFAULT 0,
-                chunk_count  INTEGER DEFAULT 0,
-                ingested_at  TEXT NOT NULL,
-                metadata     TEXT DEFAULT '{{}}', -- JSON object
-                status       TEXT DEFAULT 'complete'
-            );
+                id          TEXT PRIMARY KEY,
+                path        TEXT NOT NULL UNIQUE,
+                filename    TEXT NOT NULL,
+                file_type   TEXT NOT NULL,
+                file_hash   TEXT NOT NULL,
+                title       TEXT,
+                tags        TEXT DEFAULT '[]',
+                word_count  INTEGER DEFAULT 0,
+                chunk_count INTEGER DEFAULT 0,
+                ingested_at TEXT NOT NULL,
+                metadata    TEXT DEFAULT '{}'
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_doc_hash ON documents(file_hash)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_doc_type ON documents(file_type)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_doc_ingested ON documents(ingested_at DESC)"
+        )
 
-            CREATE INDEX IF NOT EXISTS idx_doc_hash
-                ON documents(file_hash);
-            CREATE INDEX IF NOT EXISTS idx_doc_type
-                ON documents(file_type);
-            CREATE INDEX IF NOT EXISTS idx_doc_ingested
-                ON documents(ingested_at DESC);
-
-            -- ── Chunks ─────────────────────────────────────────
+        # Chunks — rowid is the implicit SQLite integer primary key
+        # We keep a separate TEXT id for external references
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS chunks (
-                id              TEXT PRIMARY KEY,
+                id              TEXT NOT NULL UNIQUE,
                 document_id     TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
                 content         TEXT NOT NULL,
                 chunk_index     INTEGER NOT NULL,
                 page_number     INTEGER,
-                timestamp_start REAL,    -- video: seconds from start
+                timestamp_start REAL,
                 timestamp_end   REAL,
-                metadata        TEXT DEFAULT '{{}}'
-            );
+                metadata        TEXT DEFAULT '{}'
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunk_doc ON chunks(document_id)"
+        )
 
-            CREATE INDEX IF NOT EXISTS idx_chunk_doc
-                ON chunks(document_id);
-
-            -- ── Vector table ────────────────────────────────────
-            -- sqlite-vec virtual table — one row per chunk embedding
-            -- FLOAT[{EMBED_DIMS}] matches BGE-small-en-v1.5 output
+        # sqlite-vec 0.1.6 virtual table
+        # FLOAT[N] must match embedding dimensions exactly
+        # rowid here will be set to match the chunks table rowid
+        conn.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
-                chunk_id  TEXT PARTITION KEY,
                 embedding FLOAT[{EMBED_DIMS}]
-            );
+            )
+        """)
 
-            -- ── Ingestion queue ─────────────────────────────────
+        # Ingestion queue
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS ingest_queue (
                 id           TEXT PRIMARY KEY,
                 path         TEXT NOT NULL,
                 filename     TEXT NOT NULL,
-                status       TEXT DEFAULT 'queued',  -- queued|processing|complete|failed|skipped
+                status       TEXT DEFAULT 'queued',
                 error        TEXT,
                 queued_at    TEXT NOT NULL,
                 processed_at TEXT,
                 file_size    INTEGER DEFAULT 0
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_queue_status
-                ON ingest_queue(status, queued_at DESC);
+            )
         """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_queue_status "
+            "ON ingest_queue(status, queued_at DESC)"
+        )
 
     logger.info(f"DB | Schema ready at {path}")
 
@@ -165,10 +193,9 @@ def setup_db(path: str = DB_PATH) -> None:
 # ── Document operations ───────────────────────────────────────────────────────
 
 def doc_exists_by_hash(file_hash: str) -> Optional[str]:
-    """Return document id if this file hash is already ingested, else None."""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id FROM documents WHERE file_hash = ?", (file_hash,)
+            "SELECT id FROM documents WHERE file_hash=?", (file_hash,)
         ).fetchone()
     return row["id"] if row else None
 
@@ -180,30 +207,23 @@ def insert_document(
     file_type:  str,
     file_hash:  str,
     title:      Optional[str] = None,
-    tags:       list[str] = None,
+    tags:       Optional[list] = None,
     word_count: int = 0,
-    metadata:   dict = None,
+    metadata:   Optional[dict] = None,
 ) -> str:
-    """Insert a new document record. Returns the new UUID."""
     doc_id = str(uuid.uuid4())
     now    = datetime.now(timezone.utc).isoformat()
-
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO documents
-               (id, path, filename, file_type, file_hash, title, tags,
-                word_count, ingested_at, metadata)
+               (id,path,filename,file_type,file_hash,title,tags,
+                word_count,ingested_at,metadata)
                VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (
-                doc_id, path, filename, file_type, file_hash,
-                title,
-                json.dumps(tags or []),
-                word_count,
-                now,
-                json.dumps(metadata or {}),
-            ),
+            (doc_id, path, filename, file_type, file_hash,
+             title, json.dumps(tags or []),
+             word_count, now, json.dumps(metadata or {})),
         )
-    logger.debug(f"DB | Document inserted | id={doc_id} | file={filename}")
+    logger.debug(f"DB | Document inserted id={doc_id} file={filename}")
     return doc_id
 
 
@@ -233,21 +253,18 @@ def list_recent_documents(
     file_type: Optional[str] = None,
     tag: Optional[str] = None,
 ) -> list[dict]:
-    query  = "SELECT * FROM documents WHERE 1=1"
-    params: list = []
-
-    if file_type:
-        query += " AND file_type=?"
-        params.append(file_type)
     if tag:
-        # Tags stored as JSON array — use JSON_EACH for correct filtering
-        query = (
-            "SELECT d.* FROM documents d, json_each(d.tags) t "
-            "WHERE t.value=?"
-        )
-        params = [tag]
+        query  = ("SELECT d.* FROM documents d, json_each(d.tags) t "
+                  "WHERE t.value=?")
+        params: list = [tag]
         if file_type:
             query += " AND d.file_type=?"
+            params.append(file_type)
+    else:
+        query  = "SELECT * FROM documents WHERE 1=1"
+        params = []
+        if file_type:
+            query += " AND file_type=?"
             params.append(file_type)
 
     query += " ORDER BY ingested_at DESC LIMIT ?"
@@ -269,54 +286,58 @@ def list_recent_documents(
 
 def insert_chunks_batch(
     document_id: str,
-    chunks: list[dict],
-    embeddings: list[list[float]],
+    chunks:      list[dict],
+    embeddings:  list[list[float]],
 ) -> None:
     """
-    Insert all chunks and their embeddings in one transaction.
+    Insert all chunks and embeddings in one transaction.
 
-    chunks: list of dicts with keys:
-        content, chunk_index, page_number (optional),
-        timestamp_start (optional), timestamp_end (optional), metadata (optional)
+    sqlite-vec 0.1.6 rowid linkage:
+        1. Insert chunk row → get its rowid via lastrowid
+        2. Insert vec_chunks row with the same rowid
+        3. JOIN at search time using rowid equality
 
-    embeddings: parallel list of float lists, one per chunk.
+    We cannot use executemany for the vec_chunks step because
+    we need the lastrowid of each chunk individually.
+    All inserts happen in a single transaction for atomicity.
     """
     if len(chunks) != len(embeddings):
         raise ValueError(
-            f"Chunks ({len(chunks)}) and embeddings ({len(embeddings)}) must match"
+            f"chunks ({len(chunks)}) and embeddings ({len(embeddings)}) mismatch"
         )
-
-    chunk_rows   = []
-    vec_rows     = []
-
-    for chunk, emb in zip(chunks, embeddings):
-        cid = str(uuid.uuid4())
-        chunk_rows.append((
-            cid,
-            document_id,
-            chunk["content"],
-            chunk["chunk_index"],
-            chunk.get("page_number"),
-            chunk.get("timestamp_start"),
-            chunk.get("timestamp_end"),
-            json.dumps(chunk.get("metadata") or {}),
-        ))
-        vec_rows.append((cid, _serialize(emb)))
 
     with get_conn() as conn:
-        conn.executemany(
-            """INSERT INTO chunks
-               (id, document_id, content, chunk_index, page_number,
-                timestamp_start, timestamp_end, metadata)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            chunk_rows,
-        )
-        conn.executemany(
-            "INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?,?)",
-            vec_rows,
-        )
+        for chunk, emb in zip(chunks, embeddings):
+            cid = str(uuid.uuid4())
 
-    logger.debug(f"DB | {len(chunks)} chunks + embeddings inserted | doc={document_id}")
+            # Insert chunk and capture its rowid
+            cur = conn.execute(
+                """INSERT INTO chunks
+                   (id, document_id, content, chunk_index,
+                    page_number, timestamp_start, timestamp_end, metadata)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    cid,
+                    document_id,
+                    chunk["content"],
+                    chunk["chunk_index"],
+                    chunk.get("page_number"),
+                    chunk.get("timestamp_start"),
+                    chunk.get("timestamp_end"),
+                    json.dumps(chunk.get("metadata") or {}),
+                ),
+            )
+            chunk_rowid = cur.lastrowid
+
+            # Insert embedding with matching rowid
+            conn.execute(
+                "INSERT INTO vec_chunks(rowid, embedding) VALUES (?,?)",
+                (chunk_rowid, _serialize(emb)),
+            )
+
+    logger.debug(
+        f"DB | {len(chunks)} chunks+embeddings inserted | doc={document_id}"
+    )
 
 
 def get_chunks_by_doc(document_id: str) -> list[dict]:
@@ -331,38 +352,36 @@ def get_chunks_by_doc(document_id: str) -> list[dict]:
 # ── Vector search ─────────────────────────────────────────────────────────────
 
 def vector_search(
-    query_embedding: list[float],
-    top_k: int = 10,
-    tag_filter: Optional[str] = None,
+    query_embedding:  list[float],
+    top_k:            int = 10,
+    tag_filter:       Optional[str] = None,
     file_type_filter: Optional[str] = None,
 ) -> list[dict]:
     """
-    Semantic search using sqlite-vec ANN (HNSW).
+    ANN search using sqlite-vec 0.1.6.
 
-    Returns list of result dicts with keys:
-        chunk_id, distance, content, document_id,
-        filename, file_type, tags, page_number,
-        timestamp_start, timestamp_end
+    sqlite-vec 0.1.6 search syntax:
+        SELECT rowid, distance
+        FROM vec_chunks
+        WHERE embedding MATCH ?   ← serialized float blob
+          AND k = ?               ← plain integer parameter
 
-    The JOIN with chunks and documents adds metadata without
-    a second query — sqlite optimises this well with the indexes.
+    We fetch extra results when filters are active to account for
+    post-filter elimination, then trim to top_k.
 
-    tag_filter: if provided, only return results from documents
-    with this tag. Applied as a post-filter (sqlite-vec does not
-    support pre-filtering on metadata columns natively).
+    The JOIN uses vec_chunks.rowid = chunks.rowid — this is the
+    link established during insert_chunks_batch().
     """
     serialized = _serialize(query_embedding)
+    fetch_k    = top_k * 5 if (tag_filter or file_type_filter) else top_k
 
     with get_conn() as conn:
-        # Fetch more results than top_k if filtering, to account for
-        # results that will be filtered out
-        fetch_k = top_k * 5 if (tag_filter or file_type_filter) else top_k
-
         rows = conn.execute(
-            f"""
+            """
             SELECT
-                v.chunk_id,
+                v.rowid      AS vec_rowid,
                 v.distance,
+                c.id         AS chunk_id,
                 c.content,
                 c.document_id,
                 c.page_number,
@@ -373,13 +392,13 @@ def vector_search(
                 d.tags,
                 d.path
             FROM vec_chunks v
-            JOIN chunks c   ON c.id = v.chunk_id
-            JOIN documents d ON d.id = c.document_id
+            JOIN chunks    c ON c.rowid = v.rowid
+            JOIN documents d ON d.id    = c.document_id
             WHERE v.embedding MATCH ?
-              AND k = {fetch_k}
+              AND k = ?
             ORDER BY v.distance
             """,
-            [serialized],
+            (serialized, fetch_k),
         ).fetchall()
 
     results = []
@@ -392,18 +411,18 @@ def vector_search(
             continue
 
         results.append({
-            "chunk_id":       row["chunk_id"],
-            "distance":       row["distance"],
-            "score":          round(1 - row["distance"], 4),
-            "content":        row["content"],
-            "document_id":    row["document_id"],
-            "page_number":    row["page_number"],
+            "chunk_id":        row["chunk_id"],
+            "distance":        row["distance"],
+            "score":           round(max(0.0, 1.0 - row["distance"]), 4),
+            "content":         row["content"],
+            "document_id":     row["document_id"],
+            "page_number":     row["page_number"],
             "timestamp_start": row["timestamp_start"],
-            "timestamp_end":  row["timestamp_end"],
-            "filename":       row["filename"],
-            "file_type":      row["file_type"],
-            "tags":           tags,
-            "path":           row["path"],
+            "timestamp_end":   row["timestamp_end"],
+            "filename":        row["filename"],
+            "file_type":       row["file_type"],
+            "tags":            tags,
+            "path":            row["path"],
         })
 
         if len(results) >= top_k:
@@ -415,7 +434,6 @@ def vector_search(
 # ── Queue operations ──────────────────────────────────────────────────────────
 
 def queue_file(path: str, file_size: int = 0) -> str:
-    """Add a file to the ingestion queue. Returns queue entry id."""
     qid = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
@@ -429,16 +447,12 @@ def queue_file(path: str, file_size: int = 0) -> str:
 
 
 def update_queue_status(
-    qid: str,
-    status: str,
-    error: Optional[str] = None,
+    qid: str, status: str, error: Optional[str] = None
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         conn.execute(
-            """UPDATE ingest_queue
-               SET status=?, error=?, processed_at=?
-               WHERE id=?""",
+            "UPDATE ingest_queue SET status=?,error=?,processed_at=? WHERE id=?",
             (status, error, now, qid),
         )
 
@@ -448,17 +462,17 @@ def get_queue_stats() -> dict:
         rows = conn.execute(
             "SELECT status, COUNT(*) as n FROM ingest_queue GROUP BY status"
         ).fetchall()
-        total_docs = conn.execute(
+        total_docs   = conn.execute(
             "SELECT COUNT(*) as n FROM documents"
         ).fetchone()["n"]
         total_chunks = conn.execute(
             "SELECT COUNT(*) as n FROM chunks"
         ).fetchone()["n"]
 
-    stats = {s: 0 for s in ["queued", "processing", "complete", "failed", "skipped"]}
+    stats = {s: 0 for s in
+             ["queued", "processing", "complete", "failed", "skipped"]}
     for row in rows:
         stats[row["status"]] = row["n"]
-
     stats["total_documents"] = total_docs
     stats["total_chunks"]    = total_chunks
     return stats
@@ -466,7 +480,7 @@ def get_queue_stats() -> dict:
 
 def get_queue_items(
     status: Optional[str] = None,
-    limit: int = 50,
+    limit:  int = 50,
 ) -> list[dict]:
     query  = "SELECT * FROM ingest_queue"
     params: list = []
@@ -475,7 +489,6 @@ def get_queue_items(
         params.append(status)
     query += " ORDER BY queued_at DESC LIMIT ?"
     params.append(limit)
-
     with get_conn() as conn:
         rows = conn.execute(query, params).fetchall()
     return [dict(r) for r in rows]
@@ -484,7 +497,8 @@ def get_queue_items(
 def path_already_queued(path: str) -> bool:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id FROM ingest_queue WHERE path=? AND status IN ('queued','processing','complete')",
+            "SELECT id FROM ingest_queue "
+            "WHERE path=? AND status IN ('queued','processing','complete')",
             (path,),
         ).fetchone()
     return row is not None
@@ -493,20 +507,19 @@ def path_already_queued(path: str) -> bool:
 # ── Async wrappers ────────────────────────────────────────────────────────────
 
 async def async_vector_search(
-    query_embedding: list[float],
-    top_k: int = 10,
-    tag_filter: Optional[str] = None,
+    query_embedding:  list[float],
+    top_k:            int = 10,
+    tag_filter:       Optional[str] = None,
     file_type_filter: Optional[str] = None,
 ) -> list[dict]:
-    """Non-blocking vector search for async routes."""
     return await asyncio.to_thread(
         vector_search, query_embedding, top_k, tag_filter, file_type_filter
     )
 
 
 async def async_list_recent(
-    limit: int = 20,
+    limit:     int = 20,
     file_type: Optional[str] = None,
-    tag: Optional[str] = None,
+    tag:       Optional[str] = None,
 ) -> list[dict]:
     return await asyncio.to_thread(list_recent_documents, limit, file_type, tag)
