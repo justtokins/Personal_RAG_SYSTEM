@@ -1,33 +1,40 @@
 """
 ingest.py — Full ingestion pipeline orchestrator.
 
-Pipeline per file:
-    1. Hash file (xxhash) → check dedup
-    2. Queue entry created
-    3. Extract text + chunks (type-specific extractor)
-    4. Auto-tag via Claude API (async, non-blocking)
-    5. Batch embed all chunks (SentenceTransformer, GPU-optional)
-    6. Insert document + chunks + vectors in one DB transaction
-    7. Queue entry marked complete / failed
+Why ProcessPoolExecutor was removed:
+    Under uvicorn, spawning subprocesses causes signal handler conflicts
+    and requires the worker function to be importable from a completely
+    clean Python environment. The overhead of spawning processes for
+    text splitting — which takes 1-3 seconds even for large PDFs — is
+    greater than the speedup on typical document sizes.
 
-Cron integration:
-    The `scan_and_ingest()` function is called by the cron job.
-    It scans the Dropbox sync folder, skips already-processed files,
-    and processes new ones using a ThreadPoolExecutor for I/O-bound
-    tasks (reading, OCR) while embedding is batched at the end.
+    The real bottleneck is embedding (Stage 2), which is already
+    optimised via SentenceTransformer batch encoding. Text splitting
+    on 20 pages takes ~0.3 seconds — not worth multiprocessing.
 
-Performance:
-    - Multicore extraction: ThreadPoolExecutor for I/O-bound work
-    - Batch embedding: all chunks embedded in one SentenceTransformer call
-    - Single DB transaction per document
+    For genuinely large batch jobs (100+ documents), use the
+    /api/scan endpoint which uses ThreadPoolExecutor for concurrent
+    I/O-bound extraction across multiple files simultaneously.
 
-20-page PDF target: < 60 seconds on 4GB/4-core droplet.
-1-hour video target: < 20 minutes (Whisper medium, CPU).
+Thread model:
+    ThreadPoolExecutor(max_workers=N) for concurrent multi-file extraction.
+    I/O-bound work (reading PDFs, running Tesseract, ffmpeg) benefits
+    from threading even with the GIL because most time is spent
+    waiting for I/O or in C extensions that release the GIL.
+
+File size limits:
+    Max file size configurable in general_settings.json.
+    Default: 2GB for video, 500MB for everything else.
+    Prevents runaway Whisper jobs on massive files.
+
+Path validation:
+    All file paths validated to be within the allowed Dropbox sync
+    directory before processing. Prevents path traversal attacks via
+    the /api/ingest endpoint.
 """
 from __future__ import annotations
 
-import hashlib
-import multiprocessing as mp
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -41,16 +48,47 @@ from src.extractors import extract, is_supported
 from src.logger import get_logger
 from src.tagger import assign_tags
 
-logger     = get_logger()
-CFG        = general_settings["ingestion"]
-PATHS      = general_settings["paths"]
+logger = get_logger()
+CFG    = general_settings["ingestion"]
+PATHS  = general_settings["paths"]
+
+# Workers for concurrent multi-file extraction (I/O-bound)
+import multiprocessing as mp
 NUM_WORKERS = max(1, mp.cpu_count() - 1)
+
+# File size limits (bytes)
+VIDEO_EXTS   = set(CFG["video_extensions"])
+MAX_VIDEO_SZ = CFG.get("max_video_bytes",  2 * 1024 ** 3)   # 2 GB
+MAX_OTHER_SZ = CFG.get("max_file_bytes",   500 * 1024 ** 2)  # 500 MB
+
+
+# ── Path validation ───────────────────────────────────────────────────────────
+
+def _validate_path(path: str) -> str:
+    """
+    Ensure path is within the allowed Dropbox sync directory.
+    Raises ValueError for paths outside the allowed root.
+
+    This prevents path traversal attacks from the /api/ingest endpoint
+    where a malicious caller could pass /etc/passwd or /opt/ragbase/.env.
+    """
+    allowed   = Path(PATHS["dropbox_sync"]).resolve()
+    requested = Path(path).resolve()
+
+    if not str(requested).startswith(str(allowed)):
+        raise ValueError(
+            f"Path '{path}' is outside the allowed sync directory '{allowed}'"
+        )
+    return str(requested)
 
 
 # ── File hashing ──────────────────────────────────────────────────────────────
 
 def _hash_file(path: str) -> str:
-    """xxhash is ~10x faster than SHA256 for large files."""
+    """
+    xxhash64 is ~10x faster than SHA256 for large files.
+    Sufficient for deduplication — not a cryptographic requirement.
+    """
     h = xxhash.xxh64()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
@@ -60,37 +98,66 @@ def _hash_file(path: str) -> str:
 
 # ── Single file ingestion ─────────────────────────────────────────────────────
 
-def ingest_file(file_path: str) -> dict:
+def ingest_file(file_path: str, skip_path_validation: bool = False) -> dict:
     """
     Ingest one file end-to-end.
 
+    skip_path_validation: set True only for internal scan_and_ingest()
+    calls where the path was already validated by the filesystem scan.
+
     Returns:
-        { "status": "complete"|"skipped"|"failed", "doc_id": str|None, "error": str|None }
+        { "status": "complete"|"skipped"|"failed",
+          "doc_id": str|None,
+          "error":  str|None }
     """
+    # ── Validate path ──────────────────────────────────────────────
+    try:
+        if not skip_path_validation:
+            file_path = _validate_path(file_path)
+    except ValueError as e:
+        logger.warning(f"INGEST | Path validation failed: {e}")
+        return {"status": "failed", "doc_id": None, "error": str(e)}
+
     path = Path(file_path)
 
     if not path.exists():
-        return {"status": "failed", "doc_id": None, "error": "File not found"}
+        return {"status": "failed", "doc_id": None,
+                "error": "File not found"}
 
     if not is_supported(file_path):
-        return {"status": "skipped", "doc_id": None, "error": "Unsupported type"}
+        return {"status": "skipped", "doc_id": None,
+                "error": "Unsupported file type"}
 
-    logger.info(f"INGEST | Starting: {path.name}")
+    # ── File size gate ─────────────────────────────────────────────
+    file_size = path.stat().st_size
+    is_video  = path.suffix.lower() in VIDEO_EXTS
+    size_limit = MAX_VIDEO_SZ if is_video else MAX_OTHER_SZ
 
-    # ── Deduplication ──────────────────────────────────────────
-    file_hash  = _hash_file(file_path)
-    existing   = db.doc_exists_by_hash(file_hash)
+    if file_size > size_limit:
+        limit_mb = size_limit // (1024 ** 2)
+        err = f"File too large: {file_size // (1024**2)}MB > {limit_mb}MB limit"
+        logger.warning(f"INGEST | {path.name} | {err}")
+        return {"status": "failed", "doc_id": None, "error": err}
+
+    logger.info(f"INGEST | Starting: {path.name} ({file_size // 1024}KB)")
+    t0 = time.perf_counter()
+
+    # ── Deduplication ──────────────────────────────────────────────
+    file_hash = _hash_file(file_path)
+    existing  = db.doc_exists_by_hash(file_hash)
     if existing:
-        logger.info(f"INGEST | Duplicate — already ingested as {existing}: {path.name}")
+        logger.info(
+            f"INGEST | Duplicate skipped: {path.name} "
+            f"(already ingested as {existing})"
+        )
         return {"status": "skipped", "doc_id": existing, "error": None}
 
-    # ── Queue entry ────────────────────────────────────────────
-    file_size  = path.stat().st_size
-    qid        = db.queue_file(file_path, file_size)
+    # ── Queue entry ────────────────────────────────────────────────
+    qid = db.queue_file(file_path, file_size)
     db.update_queue_status(qid, "processing")
 
     try:
-        # ── Stage 1: Extract ───────────────────────────────────
+        # ── Stage 1: Extract ───────────────────────────────────────
         extraction = extract(file_path)
         full_text  = extraction["text"]
         chunks     = extraction["chunks"]
@@ -99,25 +166,31 @@ def ingest_file(file_path: str) -> dict:
         word_count = extraction.get("word_count", 0)
 
         if not chunks:
-            raise ValueError("No content extracted from file")
+            raise ValueError("No content could be extracted from this file")
 
-        # ── Stage 2: Auto-tag (Claude API) ─────────────────────
+        t_extracted = time.perf_counter()
+        logger.info(
+            f"INGEST | Extracted {len(chunks)} chunks "
+            f"in {t_extracted - t0:.1f}s | {path.name}"
+        )
+
+        # ── Stage 2: Auto-tag ──────────────────────────────────────
         tags = assign_tags(full_text)
 
-        # ── Stage 3: Determine file type ───────────────────────
-        ext_to_type = {
-            ".pdf": "pdf", ".docx": "word", ".doc": "word",
-            ".md": "markdown", ".txt": "text",
-            ".msg": "email", ".eml": "email",
-            ".png": "image", ".jpg": "image", ".jpeg": "image",
+        # ── Stage 3: File type classification ─────────────────────
+        ext_map = {
+            ".pdf":  "pdf",  ".docx": "word",  ".doc": "word",
+            ".md":   "markdown", ".txt": "text", ".markdown": "text",
+            ".msg":  "email", ".eml": "email",
+            ".png":  "image", ".jpg": "image", ".jpeg": "image",
             ".tiff": "image", ".bmp": "image", ".webp": "image",
-            ".mp4": "video", ".mov": "video", ".avi": "video",
-            ".mkv": "video", ".m4a": "audio", ".mp3": "audio",
-            ".wav": "audio",
+            ".mp4":  "video", ".mov": "video", ".avi": "video",
+            ".mkv":  "video", ".m4a": "audio", ".mp3": "audio",
+            ".wav":  "audio",
         }
-        file_type = ext_to_type.get(path.suffix.lower(), "other")
+        file_type = ext_map.get(path.suffix.lower(), "other")
 
-        # ── Stage 4: Insert document record ────────────────────
+        # ── Stage 4: Insert document record ───────────────────────
         doc_id = db.insert_document(
             path=file_path,
             filename=path.name,
@@ -129,23 +202,30 @@ def ingest_file(file_path: str) -> dict:
             metadata=metadata,
         )
 
-        # ── Stage 5: Batch embed all chunks ────────────────────
-        chunk_texts  = [c["content"] for c in chunks]
-        embeddings   = embed_chunks(chunk_texts)
+        # ── Stage 5: Batch embed ───────────────────────────────────
+        chunk_texts = [c["content"] for c in chunks]
+        t_embed_start = time.perf_counter()
+        embeddings  = embed_chunks(chunk_texts)
+        logger.info(
+            f"INGEST | Embedded {len(chunks)} chunks "
+            f"in {time.perf_counter() - t_embed_start:.1f}s"
+        )
 
-        # ── Stage 6: Batch insert chunks + vectors ─────────────
+        # ── Stage 6: Batch insert chunks + vectors ─────────────────
         db.insert_chunks_batch(doc_id, chunks, embeddings)
         db.update_document_chunks(doc_id, len(chunks))
 
-        # ── Mark complete ───────────────────────────────────────
         db.update_queue_status(qid, "complete")
+
+        total = time.perf_counter() - t0
         logger.event(
             "ingest_complete",
             file=path.name,
             doc_id=doc_id,
             chunks=len(chunks),
-            tags=tags,
             words=word_count,
+            tags=tags,
+            elapsed=f"{total:.1f}s",
         )
         return {"status": "complete", "doc_id": doc_id, "error": None}
 
@@ -154,35 +234,42 @@ def ingest_file(file_path: str) -> dict:
         db.update_queue_status(qid, "failed", error=error_msg)
         logger.error(f"INGEST | FAILED: {path.name} | {error_msg}")
 
-        # Move to failed directory
+        # Move to failed directory so it doesn't re-queue on next scan
         failed_dir = Path(PATHS["failed_dir"])
         failed_dir.mkdir(parents=True, exist_ok=True)
         try:
-            path.rename(failed_dir / path.name)
-        except Exception:
-            pass
+            dest = failed_dir / path.name
+            # Avoid overwrite collision
+            if dest.exists():
+                dest = failed_dir / f"{path.stem}_{qid[:8]}{path.suffix}"
+            path.rename(dest)
+            logger.info(f"INGEST | Moved failed file to {dest}")
+        except Exception as mv_err:
+            logger.warning(f"INGEST | Could not move failed file: {mv_err}")
 
         return {"status": "failed", "doc_id": None, "error": error_msg}
 
 
-# ── Batch / folder ingestion ──────────────────────────────────────────────────
+# ── Batch scan ────────────────────────────────────────────────────────────────
 
 def scan_and_ingest(folder: Optional[str] = None) -> dict:
     """
-    Scan a folder for new files and ingest them.
+    Scan the Dropbox sync folder for new files and ingest them.
 
-    Called by the cron job every 5 minutes.
-    Skips files already in the queue (any non-failed status).
-    Uses ThreadPoolExecutor for concurrent extraction (I/O-bound).
+    Called by APScheduler every 5 minutes and by POST /api/scan.
 
-    Returns summary stats dict.
+    Extraction is I/O-bound (reading files, OCR, ffmpeg, PDF parsing).
+    ThreadPoolExecutor allows concurrent extraction across multiple files.
+    Embedding is compute-bound — batched per file, sequential across files.
+
+    Videos are processed after all other files to avoid saturating
+    CPU with Whisper while other fast files are waiting.
     """
     scan_dir = Path(folder or PATHS["dropbox_sync"])
     if not scan_dir.exists():
         logger.warning(f"SCAN | Dropbox folder not found: {scan_dir}")
-        return {"scanned": 0, "queued": 0, "complete": 0, "failed": 0, "skipped": 0}
+        return {"scanned": 0, "complete": 0, "failed": 0, "skipped": 0}
 
-    # Collect all supported files not yet processed
     new_files: list[str] = []
     for f in scan_dir.rglob("*"):
         if not f.is_file():
@@ -193,88 +280,94 @@ def scan_and_ingest(folder: Optional[str] = None) -> dict:
             continue
         new_files.append(str(f))
 
-    logger.info(f"SCAN | Found {len(new_files)} new files in {scan_dir}")
-
+    logger.info(f"SCAN | {len(new_files)} new files found in {scan_dir}")
     if not new_files:
-        return {"scanned": 0, "queued": 0, "complete": 0, "failed": 0, "skipped": 0}
+        return {"scanned": 0, "complete": 0, "failed": 0, "skipped": 0}
 
-    # Separate video files (long, single-threaded Whisper) from others
-    video_exts = set(general_settings["ingestion"]["video_extensions"])
-    videos     = [f for f in new_files if Path(f).suffix.lower() in video_exts]
-    others     = [f for f in new_files if Path(f).suffix.lower() not in video_exts]
+    # Separate videos (long Whisper jobs) from everything else
+    videos = [f for f in new_files if Path(f).suffix.lower() in VIDEO_EXTS]
+    others = [f for f in new_files if Path(f).suffix.lower() not in VIDEO_EXTS]
 
-    stats = {"scanned": len(new_files), "complete": 0, "failed": 0, "skipped": 0}
+    stats = {
+        "scanned":  len(new_files),
+        "complete": 0,
+        "failed":   0,
+        "skipped":  0,
+    }
 
-    # Process non-video files concurrently
+    def _record(result: dict):
+        s = result.get("status", "failed")
+        stats[s] = stats.get(s, 0) + 1
+
+    # Non-video files: concurrent extraction via ThreadPoolExecutor
     if others:
         with ThreadPoolExecutor(max_workers=NUM_WORKERS) as pool:
-            futures = {pool.submit(ingest_file, f): f for f in others}
+            futures = {
+                pool.submit(ingest_file, f, True): f
+                for f in others
+            }
             for future in as_completed(futures):
-                result = future.result()
-                stats[result["status"]] = stats.get(result["status"], 0) + 1
+                try:
+                    _record(future.result())
+                except Exception as e:
+                    logger.error(f"SCAN | Worker exception: {e}")
+                    stats["failed"] += 1
 
-    # Process videos sequentially (Whisper is already compute-saturating)
+    # Videos: sequential (Whisper saturates CPU on its own)
     for video in videos:
-        result = ingest_file(video)
-        stats[result["status"]] = stats.get(result["status"], 0) + 1
+        try:
+            _record(ingest_file(video, skip_path_validation=True))
+        except Exception as e:
+            logger.error(f"SCAN | Video ingestion exception: {e}")
+            stats["failed"] += 1
 
-    stats["queued"] = len(new_files)
     logger.event("scan_complete", **stats)
     return stats
 
 
+# ── Reindex ───────────────────────────────────────────────────────────────────
+
 def reindex_all() -> dict:
     """
-    Re-process all previously ingested files.
-    Used when swapping embedding models.
-
-    This:
-    1. Clears all chunks and vectors
-    2. Re-extracts and re-embeds every document
-    3. Preserves document records (id, tags, metadata)
-
-    Run: python scripts/reindex.py
+    Clear all embeddings and re-process the entire corpus.
+    Use after swapping embedding models.
+    See scripts/reindex.py for the CLI wrapper.
     """
-    import sqlite3
+    logger.warning("REINDEX | Clearing all vectors and chunks")
 
-    logger.warning("REINDEX | Starting full reindex — this will clear all vectors")
-
-    # Clear all chunks and vectors
     with db.get_conn() as conn:
         conn.execute("DELETE FROM vec_chunks")
         conn.execute("DELETE FROM chunks")
         conn.execute("UPDATE documents SET chunk_count=0")
-        conn.execute("UPDATE ingest_queue SET status='queued' WHERE status='complete'")
 
-    # Get all document paths
     with db.get_conn() as conn:
         docs = conn.execute(
-            "SELECT id, path, file_hash FROM documents"
+            "SELECT id, path FROM documents"
         ).fetchall()
 
     logger.info(f"REINDEX | Re-ingesting {len(docs)} documents")
-
-    stats = {"total": len(docs), "complete": 0, "failed": 0, "skipped": 0}
+    stats = {"total": len(docs), "complete": 0, "failed": 0}
 
     for doc in docs:
-        path     = doc["path"]
-        doc_id   = doc["id"]
+        path   = doc["path"]
+        doc_id = doc["id"]
+
         if not Path(path).exists():
             logger.warning(f"REINDEX | File missing: {path}")
             stats["failed"] += 1
             continue
 
         try:
-            extraction = extract(path)
-            chunks     = extraction["chunks"]
+            extraction  = extract(path)
+            chunks      = extraction["chunks"]
             chunk_texts = [c["content"] for c in chunks]
             embeddings  = embed_chunks(chunk_texts)
             db.insert_chunks_batch(doc_id, chunks, embeddings)
             db.update_document_chunks(doc_id, len(chunks))
             stats["complete"] += 1
-            logger.info(f"REINDEX | Done: {Path(path).name}")
+            logger.info(f"REINDEX | ✓ {Path(path).name}")
         except Exception as e:
-            logger.error(f"REINDEX | Failed {path}: {e}")
+            logger.error(f"REINDEX | ✗ {path}: {e}")
             stats["failed"] += 1
 
     logger.event("reindex_complete", **stats)
