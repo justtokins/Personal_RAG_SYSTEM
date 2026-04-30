@@ -11,12 +11,12 @@
     "log_backup_count": 5
   },
   "paths": {
-    "dropbox_sync": "/home/ragbase/Dropbox",
-    "db_path": "/opt/ragbase/data/ragbase.db",
-    "upload_dir": "/opt/ragbase/uploads",
-    "backup_dir": "/opt/ragbase/backups",
+    "dropbox_sync":  "/home/ragbase/Dropbox",
+    "db_path":       "/opt/ragbase/data/ragbase.db",
+    "upload_dir":    "/opt/ragbase/uploads",
+    "backup_dir":    "/opt/ragbase/backups",
     "whisper_cache": "/opt/ragbase/.whisper_cache",
-    "failed_dir": "/opt/ragbase/failed"
+    "failed_dir":    "/opt/ragbase/failed"
   },
   "embedding": {
     "model_name": "BAAI/bge-small-en-v1.5",
@@ -25,28 +25,33 @@
     "device": "cpu",
     "normalize": true
   },
+  "vector_provider": "sqlite_vec",
   "ingestion": {
     "chunk_size": 800,
     "chunk_overlap": 150,
     "separators": ["\n\n", "\n", ". ", " "],
     "embed_batch_size": 64,
-    "max_workers": 3,
     "poll_interval_seconds": 300,
+    "max_file_bytes": 524288000,
+    "max_video_bytes": 2147483648,
     "supported_extensions": [
-      ".pdf", ".docx", ".doc", ".md", ".txt",
+      ".pdf", ".docx", ".doc", ".md", ".txt", ".markdown",
       ".msg", ".eml",
       ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp",
       ".mp4", ".mov", ".avi", ".mkv", ".m4a", ".mp3", ".wav"
     ],
-    "image_extensions": [".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp"],
-    "video_extensions": [".mp4", ".mov", ".avi", ".mkv", ".m4a", ".mp3", ".wav"],
+    "image_extensions": [
+      ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp"
+    ],
+    "video_extensions": [
+      ".mp4", ".mov", ".avi", ".mkv", ".m4a", ".mp3", ".wav"
+    ],
     "email_extensions": [".msg", ".eml"]
   },
   "whisper": {
     "model": "medium",
     "language": null,
-    "device": "cpu",
-    "chunk_duration_seconds": 30
+    "device": "cpu"
   },
   "search": {
     "default_top_k": 10,
