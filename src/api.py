@@ -203,7 +203,7 @@ async def _scheduled_scan():
     logger.info("SCHEDULER | Running scan_and_ingest")
     try:
         result = await asyncio.to_thread(scan_and_ingest)
-        logger.event("scheduled_scan", **result)
+        logger.event("scheduled_scan", actor="scheduler", **result)
     except Exception as e:
         logger.error(f"SCHEDULER | scan_and_ingest failed: {e}")
 
@@ -212,6 +212,6 @@ async def _scheduled_backup():
     logger.info("SCHEDULER | Running nightly backup")
     try:
         result = await asyncio.to_thread(run_backup)
-        logger.event("scheduled_backup", **result)
+        logger.event("scheduled_backup", actor="scheduler", **result)
     except Exception as e:
         logger.error(f"SCHEDULER | backup failed: {e}")
