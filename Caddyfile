@@ -31,13 +31,14 @@
     # Only the /mcp/* path is proxied to the MCP server.
     # Bearer token auth is handled by the MCP server itself.
     handle /mcp/* {
+	uri strip_prefix /mcp
         reverse_proxy localhost:8001 {
             # Strip /mcp prefix before forwarding
             header_up Host {upstream_hostport}
         }
     }
 
-    # ── Security headers ───────────────────────────────────────────────────
+   # ── Security headers ───────────────────────────────────────────────────
     header {
         X-Content-Type-Options    "nosniff"
         X-Frame-Options           "DENY"
