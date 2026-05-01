@@ -95,7 +95,7 @@ def search_knowledge(
     Returns:
         Formatted results with filename, page/timestamp citations and score.
     """
-    logger.event("mcp_search", q=query[:60], top_k=top_k, tag=tag_filter)
+    logger.event("mcp_search", actor="mcp", q=query[:60], top_k=top_k, tag=tag_filter)
 
     top_k     = min(max(1, top_k), SCFG["max_top_k"])
     query_emb = embed_query(query)
@@ -139,7 +139,7 @@ def get_document(doc_id: str) -> str:
     Returns:
         Full document text with metadata header.
     """
-    logger.event("mcp_get_doc", doc_id=doc_id)
+    logger.event("mcp_get_doc", actor="mcp", doc_id=doc_id)
 
     doc = db.get_document(doc_id)
     if not doc:
@@ -179,7 +179,7 @@ def list_recent(
     Returns:
         Document list with IDs usable in get_document.
     """
-    logger.event("mcp_list_recent", limit=limit, file_type=file_type, tag=tag)
+    logger.event("mcp_list_recent", actor="mcp", limit=limit, file_type=file_type, tag=tag)
 
     limit = min(max(1, limit), 100)
     docs  = db.list_recent_documents(limit=limit, file_type=file_type, tag=tag)
@@ -218,7 +218,7 @@ def get_video_segment(
         Transcript covering [timestamp − window/2, timestamp + window/2]
         with per-segment timestamps.
     """
-    logger.event("mcp_video_seg", doc_id=doc_id, ts=timestamp)
+    logger.event("mcp_video_seg", actor="mcp", doc_id=doc_id, ts=timestamp)
 
     doc = db.get_document(doc_id)
     if not doc:
