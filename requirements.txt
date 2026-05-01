@@ -2,14 +2,7 @@
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 pydantic==2.7.1
-python-multipart==0.0.9
 python-dotenv==1.0.1
-httpx==0.27.0
-aiofiles==23.2.1
-jinja2==3.1.4
-
-# ── Rate limiting ─────────────────────────────────────────────────────────────
-slowapi==0.1.9
 
 # ── MCP server ────────────────────────────────────────────────────────────────
 mcp==1.0.0
@@ -21,15 +14,13 @@ sqlite-vec==0.1.6
 sentence-transformers==3.0.1
 # CPU-only PyTorch — install BEFORE requirements with:
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
-# The line below is for reference; setup.sh handles the CPU-only install.
+# setup.sh handles this automatically. The line below pins the version for reference.
 torch==2.3.1
 
 # ── Document extractors ───────────────────────────────────────────────────────
 pymupdf==1.24.5
 python-docx==1.1.2
 extract-msg==0.48.4
-mail-parser==3.15.0
-markdown==3.6
 pillow==10.4.0
 
 # ── OCR ───────────────────────────────────────────────────────────────────────
@@ -42,11 +33,11 @@ ffmpeg-python==0.2.0
 # ── Claude API (auto-tagging) ─────────────────────────────────────────────────
 anthropic==0.29.0
 
-# ── Dropbox (backup uploads) ─────────────────────────────────────────────────
+# ── Dropbox (backup uploads) ──────────────────────────────────────────────────
 # Uses refresh-token OAuth flow — see scripts/dropbox_auth.py
 dropbox==12.0.2
 
-# ── Encryption ───────────────────────────────────────────────────────────────
+# ── Encryption ────────────────────────────────────────────────────────────────
 cryptography==42.0.8
 
 # ── Scheduling ────────────────────────────────────────────────────────────────
