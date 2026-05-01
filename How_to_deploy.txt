@@ -7,7 +7,7 @@
 #    (Do this before starting — Caddy needs DNS to propagate for TLS provisioning)
 
 # 3. Clone and run setup (takes ~15 minutes, mostly Whisper model download)
-git clone https://github.com/yourname/ragbase /tmp/ragbase
+git clone https://github.com/justtokins/Personal_RAG_SYSTEM.git /tmp/ragbase
 cd /tmp/ragbase
 sudo bash scripts/setup.sh
 
