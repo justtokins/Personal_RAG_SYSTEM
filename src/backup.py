@@ -201,6 +201,7 @@ def run_backup() -> dict:
 
         logger.event(
             "backup_complete",
+            actor="scheduler",
             file=backup_name,
             size_bytes=size,
             dropbox=dropbox_path,
