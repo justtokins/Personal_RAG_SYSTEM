@@ -220,6 +220,7 @@ def ingest_file(file_path: str, skip_path_validation: bool = False) -> dict:
         total = time.perf_counter() - t0
         logger.event(
             "ingest_complete",
+            actor="cli" if skip_path_validation else "api",
             file=path.name,
             doc_id=doc_id,
             chunks=len(chunks),
@@ -321,7 +322,7 @@ def scan_and_ingest(folder: Optional[str] = None) -> dict:
             logger.error(f"SCAN | Video ingestion exception: {e}")
             stats["failed"] += 1
 
-    logger.event("scan_complete", **stats)
+    logger.event("scan_complete", actor="scheduler", **stats)
     return stats
 
 
@@ -370,5 +371,5 @@ def reindex_all() -> dict:
             logger.error(f"REINDEX | ✗ {path}: {e}")
             stats["failed"] += 1
 
-    logger.event("reindex_complete", **stats)
+    logger.event("reindex_complete", actor="cli", **stats)
     return stats
