@@ -16,7 +16,11 @@ sqlite-vec 0.1.6 API notes (verified against source):
           AND k = ?                -- integer, not string interpolation
         ORDER BY distance
 
-    PARTITION KEY does NOT exist in 0.1.6 — removed.
+    distance is L2 (Euclidean). For unit vectors (normalize=True in
+    embeddings.py), L2 distance and cosine distance are monotonically
+    equivalent: lower distance = higher similarity.
+
+Dropbox upload model:
     The chunk_id linkage is done by inserting in the same transaction
     and recording the sqlite last_insert_rowid() per chunk.
 
@@ -25,6 +29,16 @@ Connection model:
     check_same_thread=False is NOT used — each thread gets its own connection.
     WAL mode allows concurrent readers with one writer.
     busy_timeout=30000 (30s) handles long video ingestion write locks.
+
+    IMPORTANT: All sqlite3.Row objects are converted to plain dicts
+    BEFORE the connection closes. sqlite3.Row holds a reference to the
+    cursor/connection and will raise after close.
+
+Audit log:
+    audit_log is append-only — no UPDATE or DELETE ever runs on it.
+    It records every MCP tool call and every ingestion event with full
+    context so the client can query the trail independently of app logs.
+    Required by client security spec.
 """
 import asyncio
 import json
@@ -44,6 +58,7 @@ from src.logger import get_logger
 logger     = get_logger()
 DB_PATH    = general_settings["paths"]["db_path"]
 EMBED_DIMS = general_settings["embedding"]["dimensions"]
+MIN_SCORE  = general_settings["search"].get("min_score_threshold", 0.0)
 
 
 # ── Serialisation ─────────────────────────────────────────────────────────────
@@ -53,16 +68,14 @@ def _serialize(v: list[float]) -> bytes:
     return struct.pack(f"{len(v)}f", *v)
 
 
+def _distance_to_score(distance: float) -> float:
+    return round(1.0 / (1.0 + max(0.0, distance)), 4)
+
+
 # ── Connection factory ────────────────────────────────────────────────────────
 
 def _make_conn(path: str = DB_PATH) -> sqlite3.Connection:
     """
-    Open a new SQLite connection with sqlite-vec loaded.
-
-    Each call returns a brand-new connection — never share connections
-    across threads. SQLite connections are not thread-safe even with
-    check_same_thread=False when sqlite-vec is loaded.
-
     WAL mode: readers never block writers, writers never block readers.
     busy_timeout=30000: wait up to 30 seconds if DB is locked by a
     long-running ingestion write (e.g. 10k-chunk video insert).
@@ -75,8 +88,8 @@ def _make_conn(path: str = DB_PATH) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA synchronous=NORMAL")   # faster than FULL, safe with WAL
-    conn.execute("PRAGMA cache_size=-64000")    # 64MB page cache
+    conn.execute("PRAGMA synchronous=NORMAL")   
+    conn.execute("PRAGMA cache_size=-64000")   
     return conn
 
 
@@ -85,6 +98,12 @@ def get_conn(path: str = DB_PATH):
     """
     Context manager yielding a connection.
     Commits on clean exit, rolls back on exception, always closes.
+
+    IMPORTANT: Callers must convert sqlite3.Row objects to dicts INSIDE
+    this context (before the connection closes). Accessing Row fields
+    after connection.close() raises sqlite3.ProgrammingError.
+    All read functions in this module call .fetchall() + [dict(r) for r in rows]
+    before the context exits.
     """
     conn = _make_conn(path)
     try:
@@ -107,11 +126,11 @@ def setup_db(path: str = DB_PATH) -> None:
         documents   — one row per file, metadata + tags
         chunks      — text chunks with page/timestamp metadata
         vec_chunks  — sqlite-vec virtual table, rowid = chunk rowid
+        ingest_queue — file processing state for the dashboard
+        audit_log   — append-only record of all MCP calls and ingestion events
 
     The vec_chunks rowid matches the chunks rowid in the same
     transaction. This lets us JOIN without a separate ID column.
-
-    ingest_queue — file processing state for the dashboard.
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -133,17 +152,16 @@ def setup_db(path: str = DB_PATH) -> None:
             )
         """)
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_doc_hash ON documents(file_hash)"
+            "CREATE INDEX IF NOT EXISTS idx_doc_hash     ON documents(file_hash)"
         )
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_doc_type ON documents(file_type)"
+            "CREATE INDEX IF NOT EXISTS idx_doc_type     ON documents(file_type)"
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_doc_ingested ON documents(ingested_at DESC)"
         )
 
-        # Chunks — rowid is the implicit SQLite integer primary key
-        # We keep a separate TEXT id for external references
+        # Chunks
         conn.execute("""
             CREATE TABLE IF NOT EXISTS chunks (
                 id              TEXT NOT NULL UNIQUE,
@@ -160,9 +178,7 @@ def setup_db(path: str = DB_PATH) -> None:
             "CREATE INDEX IF NOT EXISTS idx_chunk_doc ON chunks(document_id)"
         )
 
-        # sqlite-vec 0.1.6 virtual table
-        # FLOAT[N] must match embedding dimensions exactly
-        # rowid here will be set to match the chunks table rowid
+        # sqlite-vec virtual table
         conn.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
                 embedding FLOAT[{EMBED_DIMS}]
@@ -187,17 +203,102 @@ def setup_db(path: str = DB_PATH) -> None:
             "ON ingest_queue(status, queued_at DESC)"
         )
 
+        # ── Audit log — append-only, never updated or deleted ─────────────
+        # Required by client security spec.
+        # event_type: 'mcp_call' | 'ingest' | 'scan' | 'backup' | 'search'
+        # actor:      'mcp' | 'api' | 'scheduler' | 'cli'
+        # detail:     JSON blob with event-specific fields
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id          TEXT PRIMARY KEY,
+                ts          TEXT NOT NULL,
+                event_type  TEXT NOT NULL,
+                actor       TEXT NOT NULL,
+                detail      TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_ts   ON audit_log(ts DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_type ON audit_log(event_type, ts DESC)"
+        )
+
     logger.info(f"DB | Schema ready at {path}")
+
+
+# ── Audit log ─────────────────────────────────────────────────────────────────
+
+def audit(
+    event_type: str,
+    actor:      str,
+    **detail,
+) -> None:
+    """
+    Write one append-only audit record.
+
+    Never raises — a logging failure must not interrupt the operation
+    being logged. Errors are written to the application log only.
+
+    Args:
+        event_type: 'mcp_call' | 'ingest' | 'scan' | 'backup' | 'search'
+        actor:      'mcp' | 'api' | 'scheduler' | 'cli'
+        **detail:   Arbitrary key-value pairs serialised to JSON
+    """
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        rid = str(uuid.uuid4())
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO audit_log (id, ts, event_type, actor, detail) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (rid, now, event_type, actor, json.dumps(detail, default=str)),
+            )
+    except Exception as e:
+        logger.error(f"AUDIT | Failed to write audit record: {e}")
+
+
+def get_audit_log(
+    event_type: Optional[str] = None,
+    actor:      Optional[str] = None,
+    since:      Optional[str] = None,   # ISO timestamp
+    limit:      int = 100,
+) -> list[dict]:
+    """Query the audit log. Used by the dashboard and CLI."""
+    query  = "SELECT * FROM audit_log WHERE 1=1"
+    params: list = []
+    if event_type:
+        query += " AND event_type=?"
+        params.append(event_type)
+    if actor:
+        query += " AND actor=?"
+        params.append(actor)
+    if since:
+        query += " AND ts >= ?"
+        params.append(since)
+    query += " ORDER BY ts DESC LIMIT ?"
+    params.append(min(limit, 1000))
+
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    results = []
+    for row in rows:
+        d = dict(row)
+        d["detail"] = json.loads(d.get("detail") or "{}")
+        results.append(d)
+    return results
 
 
 # ── Document operations ───────────────────────────────────────────────────────
 
 def doc_exists_by_hash(file_hash: str) -> Optional[str]:
+   
     with get_conn() as conn:
         row = conn.execute(
             "SELECT id FROM documents WHERE file_hash=?", (file_hash,)
         ).fetchone()
-    return row["id"] if row else None
+        return row["id"] if row else None   # extract string inside context
 
 
 def insert_document(
@@ -240,22 +341,26 @@ def get_document(doc_id: str) -> Optional[dict]:
         row = conn.execute(
             "SELECT * FROM documents WHERE id=?", (doc_id,)
         ).fetchone()
-    if not row:
-        return None
-    d = dict(row)
-    d["tags"]     = json.loads(d.get("tags") or "[]")
+        if not row:
+            return None
+        d = dict(row)    # convert inside context
+
+    d["tags"]     = json.loads(d.get("tags")     or "[]")
     d["metadata"] = json.loads(d.get("metadata") or "{}")
     return d
 
 
 def list_recent_documents(
-    limit: int = 20,
+    limit:     int = 20,
     file_type: Optional[str] = None,
-    tag: Optional[str] = None,
+    tag:       Optional[str] = None,
 ) -> list[dict]:
+   
     if tag:
-        query  = ("SELECT d.* FROM documents d, json_each(d.tags) t "
-                  "WHERE t.value=?")
+        query  = (
+            "SELECT DISTINCT d.* FROM documents d, json_each(d.tags) t "
+            "WHERE t.value=?"
+        )
         params: list = [tag]
         if file_type:
             query += " AND d.file_type=?"
@@ -268,15 +373,15 @@ def list_recent_documents(
             params.append(file_type)
 
     query += " ORDER BY ingested_at DESC LIMIT ?"
-    params.append(limit)
+    params.append(min(limit, 500))   # hard cap — dashboard doesn't need more
 
     with get_conn() as conn:
         rows = conn.execute(query, params).fetchall()
+        raw  = [dict(r) for r in rows]   # convert inside context
 
     result = []
-    for row in rows:
-        d = dict(row)
-        d["tags"]     = json.loads(d.get("tags") or "[]")
+    for d in raw:
+        d["tags"]     = json.loads(d.get("tags")     or "[]")
         d["metadata"] = json.loads(d.get("metadata") or "{}")
         result.append(d)
     return result
@@ -309,8 +414,6 @@ def insert_chunks_batch(
     with get_conn() as conn:
         for chunk, emb in zip(chunks, embeddings):
             cid = str(uuid.uuid4())
-
-            # Insert chunk and capture its rowid
             cur = conn.execute(
                 """INSERT INTO chunks
                    (id, document_id, content, chunk_index,
@@ -328,8 +431,6 @@ def insert_chunks_batch(
                 ),
             )
             chunk_rowid = cur.lastrowid
-
-            # Insert embedding with matching rowid
             conn.execute(
                 "INSERT INTO vec_chunks(rowid, embedding) VALUES (?,?)",
                 (chunk_rowid, _serialize(emb)),
@@ -346,7 +447,7 @@ def get_chunks_by_doc(document_id: str) -> list[dict]:
             "SELECT * FROM chunks WHERE document_id=? ORDER BY chunk_index",
             (document_id,),
         ).fetchall()
-    return [dict(r) for r in rows]
+        return [dict(r) for r in rows]   # convert inside context
 
 
 # ── Vector search ─────────────────────────────────────────────────────────────
@@ -357,21 +458,7 @@ def vector_search(
     tag_filter:       Optional[str] = None,
     file_type_filter: Optional[str] = None,
 ) -> list[dict]:
-    """
-    ANN search using sqlite-vec 0.1.6.
 
-    sqlite-vec 0.1.6 search syntax:
-        SELECT rowid, distance
-        FROM vec_chunks
-        WHERE embedding MATCH ?   ← serialized float blob
-          AND k = ?               ← plain integer parameter
-
-    We fetch extra results when filters are active to account for
-    post-filter elimination, then trim to top_k.
-
-    The JOIN uses vec_chunks.rowid = chunks.rowid — this is the
-    link established during insert_chunks_batch().
-    """
     serialized = _serialize(query_embedding)
     fetch_k    = top_k * 5 if (tag_filter or file_type_filter) else top_k
 
@@ -400,9 +487,16 @@ def vector_search(
             """,
             (serialized, fetch_k),
         ).fetchall()
+        raw = [dict(r) for r in rows]   # convert inside context
 
     results = []
-    for row in rows:
+    for row in raw:
+        score = _distance_to_score(row["distance"])
+
+        # FIX: apply threshold that was configured but never enforced
+        if score < MIN_SCORE:
+            continue
+
         tags = json.loads(row["tags"] or "[]")
 
         if tag_filter and tag_filter not in tags:
@@ -413,7 +507,7 @@ def vector_search(
         results.append({
             "chunk_id":        row["chunk_id"],
             "distance":        row["distance"],
-            "score":           round(max(0.0, 1.0 - row["distance"]), 4),
+            "score":           score,
             "content":         row["content"],
             "document_id":     row["document_id"],
             "page_number":     row["page_number"],
@@ -468,10 +562,12 @@ def get_queue_stats() -> dict:
         total_chunks = conn.execute(
             "SELECT COUNT(*) as n FROM chunks"
         ).fetchone()["n"]
+        # convert all Row objects before connection closes
+        status_rows  = [dict(r) for r in rows]
 
     stats = {s: 0 for s in
              ["queued", "processing", "complete", "failed", "skipped"]}
-    for row in rows:
+    for row in status_rows:
         stats[row["status"]] = row["n"]
     stats["total_documents"] = total_docs
     stats["total_chunks"]    = total_chunks
@@ -488,10 +584,10 @@ def get_queue_items(
         query += " WHERE status=?"
         params.append(status)
     query += " ORDER BY queued_at DESC LIMIT ?"
-    params.append(limit)
+    params.append(min(limit, 500))
     with get_conn() as conn:
         rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
+        return [dict(r) for r in rows]   # convert inside context
 
 
 def path_already_queued(path: str) -> bool:
@@ -501,7 +597,7 @@ def path_already_queued(path: str) -> bool:
             "WHERE path=? AND status IN ('queued','processing','complete')",
             (path,),
         ).fetchone()
-    return row is not None
+        return row is not None   # evaluate inside context
 
 
 # ── Async wrappers ────────────────────────────────────────────────────────────
