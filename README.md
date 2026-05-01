@@ -60,7 +60,11 @@ BGE-small is the default. To swap: change `embedding.model_name` in `config/gene
 
 ```bash
 # On your DigitalOcean droplet (Ubuntu 22.04)
+<<<<<<< HEAD
 git clone https://github.com/justtokins/Personal_RAG_SYSTEM.git /tmp/ragbase
+=======
+git clone https://justtokins/Personal_RAG_SYSTEM /tmp/ragbase
+>>>>>>> 2822a0c3ee9a532e26b37ff7cf84bebf346f8a02
 cd /tmp/ragbase
 sudo bash scripts/setup.sh
 ```
