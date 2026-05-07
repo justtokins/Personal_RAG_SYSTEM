@@ -1,6 +1,7 @@
 """
 extractors/text.py — Plain text and Markdown extraction.
 """
+import re
 from pathlib import Path
 
 from src.config_loader import general_settings
@@ -18,7 +19,6 @@ def extract_text(file_path: str) -> dict:
 
     # For markdown, strip syntax markers for embedding
     # but keep the text — headings are semantic signal
-    import re
     clean = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)  # headings
     clean = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", clean)        # links → text
     clean = re.sub(r"`{1,3}[^`]*`{1,3}", "", clean)               # code spans
