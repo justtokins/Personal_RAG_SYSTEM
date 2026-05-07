@@ -225,7 +225,7 @@ async function loadDocuments() {
   const tbody = document.getElementById('docs-table');
   tbody.innerHTML = d.documents.map(doc => `
     <tr>
-      <td class="text-slate-200" title="${doc.path}">${doc.filename}</td>
+      <td class="text-slate-200" title="${esc(doc.path)}">${esc(doc.filename)}</td>
       <td><span class="badge badge-queued">${doc.file_type}</span></td>
       <td>${(doc.tags||[]).map(t=>'<span class="tag-chip">'+t+'</span>').join('')}</td>
       <td class="text-slate-500">${doc.ingested_at.slice(0,10)}</td>
@@ -246,7 +246,7 @@ async function loadQueue() {
 
   tbody.innerHTML = queueItems.map(i => `
     <tr>
-      <td class="text-slate-200">${i.filename}</td>
+      <td class="text-slate-200">${esc(i.filename)}</td>
       <td><span class="badge badge-${i.status}">${i.status}</span></td>
       <td class="text-slate-500">${formatBytes(i.file_size)}</td>
       <td class="text-slate-500">${i.queued_at.slice(0,16).replace('T',' ')}</td>
@@ -261,8 +261,8 @@ async function loadQueue() {
     noFail.style.display = 'none';
     failed.innerHTML = failedItems.map(i => `
       <tr>
-        <td class="text-red-300">${i.filename}</td>
-        <td class="text-red-500 text-xs">${i.error || '—'}</td>
+        <td class="text-red-300">${esc(i.filename)}</td>
+        <td class="text-red-500 text-xs">${esc(i.error || '—')}</td>
         <td class="text-slate-500">${i.processed_at ? i.processed_at.slice(0,16).replace('T',' ') : '—'}</td>
       </tr>
     `).join('');
@@ -298,7 +298,7 @@ async function doSearch() {
           📎 ${cite} &nbsp;
           <span class="text-slate-500">score: ${r.score.toFixed(3)}</span>
         </div>
-        <div class="text-slate-300 text-sm">${r.content.slice(0, 400)}${r.content.length > 400 ? '...' : ''}</div>
+        <div class="text-slate-300 text-sm">${esc(r.content.slice(0, 400))}${r.content.length > 400 ? '...' : ''}</div>
       </div>
     `;
   }).join('');
@@ -332,6 +332,15 @@ function formatBytes(b) {
   if (b < 1024) return b + 'B';
   if (b < 1024*1024) return (b/1024).toFixed(1) + 'KB';
   return (b/1024/1024).toFixed(1) + 'MB';
+}
+
+// FIX: Escape user-controlled content before injecting into innerHTML.
+// A filename like <script>alert(1)</script>.pdf would execute without this.
+// Personal tool, low severity, but wrong practice — always escape.
+function esc(str) {
+  const d = document.createElement('div');
+  d.appendChild(document.createTextNode(String(str || '')));
+  return d.innerHTML;
 }
 
 // ── Init ───────────────────────────────────────────────────────────
