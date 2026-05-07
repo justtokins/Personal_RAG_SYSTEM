@@ -1,7 +1,6 @@
 """
 extractors/word.py — python-docx Word document extraction.
 """
-import re
 from pathlib import Path
 
 from docx import Document
