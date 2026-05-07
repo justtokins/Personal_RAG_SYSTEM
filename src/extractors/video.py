@@ -21,6 +21,33 @@ WHISPER_CFG = general_settings["whisper"]
 CHUNK_SZ    = general_settings["ingestion"]["chunk_size"]
 
 
+import threading as _threading
+_whisper_model      = None
+_whisper_model_lock = _threading.Lock()
+
+
+def _get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        with _whisper_model_lock:
+            if _whisper_model is None:
+                import whisper
+                logger.info(
+                    f"VIDEO | Loading Whisper '{WHISPER_CFG['model']}' model "
+                    f"(download_root={general_settings['paths']['whisper_cache']})"
+                )
+                try:
+                    _whisper_model = whisper.load_model(
+                        WHISPER_CFG["model"],
+                        device=WHISPER_CFG["device"],
+                        download_root=general_settings["paths"]["whisper_cache"],
+                    )
+                    logger.info("VIDEO | Whisper model ready")
+                except Exception as e:
+                    raise RuntimeError(f"Failed to load Whisper model: {e}") from e
+    return _whisper_model
+
+
 def _extract_audio(video_path: str) -> str:
     """
     Extract audio track to a 16kHz mono WAV temp file.
@@ -144,19 +171,7 @@ def extract_video(file_path: str) -> dict:
     path     = Path(file_path)
     is_audio = path.suffix.lower() in {".mp3", ".wav", ".m4a"}
 
-    logger.info(
-        f"VIDEO | Loading Whisper '{WHISPER_CFG['model']}' model "
-        f"(download_root={general_settings['paths']['whisper_cache']})"
-    )
-
-    try:
-        model = whisper.load_model(
-            WHISPER_CFG["model"],
-            device=WHISPER_CFG["device"],
-            download_root=general_settings["paths"]["whisper_cache"],
-        )
-    except Exception as e:
-        raise RuntimeError(f"Failed to load Whisper model: {e}") from e
+    model    = _get_whisper_model()   # cached singleton — no reload penalty
 
     audio_path = file_path
     temp_audio = None
