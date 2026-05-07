@@ -36,6 +36,7 @@ def _chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
         else:
             if current:
                 chunks.append(current)
+            current = ""   # FIX: reset before sentence loop or overlap calculation
             # If paragraph itself is too large, split on sentence
             if len(para) > chunk_size:
                 sentences = re.split(r"(?<=[.!?])\s+", para)
@@ -68,13 +69,14 @@ def extract_pdf(file_path: str) -> dict:
     full_text  = []
     page_texts = []
 
-    for page_num, page in enumerate(doc, start=1):
-        text = page.get_text("text")
-        if text.strip():
-            full_text.append(text)
-            page_texts.append((page_num, text))
-
-    doc.close()
+    try:
+        for page_num, page in enumerate(doc, start=1):
+            text = page.get_text("text")
+            if text.strip():
+                full_text.append(text)
+                page_texts.append((page_num, text))
+    finally:
+        doc.close()   # FIX: always close even if extraction raises
 
     # Build chunks with page number metadata
     all_chunks  = []
