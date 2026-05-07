@@ -52,9 +52,12 @@ def extract_image(file_path: str) -> dict:
     path = Path(file_path)
     img  = Image.open(str(path))
 
-    original_size = img.size
-    img           = _preprocess(img)
-    text          = pytesseract.image_to_string(img, config=TESSERACT_CONFIG)
+    try:
+        original_size = img.size
+        img           = _preprocess(img)
+        text          = pytesseract.image_to_string(img, config=TESSERACT_CONFIG)
+    finally:
+        img.close()   # FIX: release PIL image memory even if tesseract raises
 
     if not text.strip():
         logger.warning(f"IMAGE | No text detected in {path.name}")
